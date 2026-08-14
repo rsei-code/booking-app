@@ -1,3 +1,4 @@
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@500;700;800&family=Noto+Sans+JP:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
@@ -477,6 +478,21 @@ function toMinutes(t){ const [h,m] = t.split(":").map(Number); return h*60+m; }
 function resourceList(cat){ return cat === "room" ? ROOMS : (cat === "car" ? CARS : [GUEST_RESOURCE]); }
 function escapeHtml(s){ return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
+// ---------- 読み込む期間 ----------
+// 表示中の日付に合わせて、その30日前から先だけを取得する。
+// 予約が何年分たまっても、毎回の読み込み量が増えないようにするため。
+// 取りに行く開始日。90日ぶんの余裕を持たせておくことで、
+// 日付を1日ずつ動かすたびに読み直すのを防ぐ。
+function windowFrom(){
+  const base = currentDate < todayStr() ? currentDate : todayStr();
+  return addDays(base, -90);
+}
+let loadedFrom = null;
+async function ensureWindow(){
+  // 読み込んである範囲より前に移動したときだけ読み直す
+  if(loadedFrom === null || currentDate < loadedFrom) await loadBookings();
+}
+
 // ---------- backend ----------
 function padTime(t){
   if(!t) return t;
@@ -488,13 +504,17 @@ function padTime(t){
 }
 
 async function loadBookings(){
+  const from = windowFrom();
   try{
-    const res = await fetch(CONFIG.API_URL, { method: "GET" });
+    const res = await fetch(CONFIG.API_URL + "?from=" + encodeURIComponent(from), { method: "GET" });
     const data = await res.json();
-    bookings = data.success ? data.bookings : [];
+    if(!data.success) throw new Error(data.error || "取得に失敗しました");
+    bookings = data.bookings;
+    loadedFrom = from;
     bookings.forEach(b => { b.start = padTime(b.start); b.end = padTime(b.end); });
   }catch(e){
     console.error(e);
+    // 失敗しても前回の一覧をそのまま残す（画面が空になって驚かせないため）
     showToast("予約データの取得に失敗しました。通信状況を確認してください。", true);
   }
 }
@@ -519,6 +539,15 @@ async function cancelBookingRemote(id, cascade){
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
     body: JSON.stringify({ action: "cancel", id, cascade })
+  });
+  return await res.json();
+}
+
+async function addManyBookingsRemote(bookings){
+  const res = await fetch(CONFIG.API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({ action: "addMany", bookings })
   });
   return await res.json();
 }
@@ -568,18 +597,21 @@ function switchViewMode(mode){
   document.getElementById("view-week-btn").classList.toggle("active", mode === "week");
   render();
 }
-function shiftDate(delta){
+async function shiftDate(delta){
   currentDate = addDays(currentDate, currentViewMode === "week" ? delta * 7 : delta);
   document.getElementById("date-input").value = currentDate;
+  await ensureWindow();
   render();
 }
-function goToday(){
+async function goToday(){
   currentDate = todayStr();
   document.getElementById("date-input").value = currentDate;
+  await ensureWindow();
   render();
 }
-function onDateChange(){
+async function onDateChange(){
   currentDate = document.getElementById("date-input").value || todayStr();
+  await ensureWindow();
   render();
 }
 
@@ -1067,16 +1099,18 @@ async function submitBooking(){
     const dates = gen.dates;
     const monthSkipped = gen.skipped || [];
 
-    const results = [];
-    for(let i=0;i<dates.length;i++){
-      submitBtn.textContent = `送信中…（${i+1}/${dates.length}）`;
-      const occBooking = Object.assign({}, booking, { date: dates[i] });
-      try{
-        const r = await addBookingRemote(occBooking);
-        results.push({ date: dates[i], success: !!r.success, error: r.error });
-      }catch(e){
-        results.push({ date: dates[i], success: false, error: "通信エラー" });
+    // まとめて1回で送る（1件ずつ送ると、その間ほかの人の登録を待たせてしまう）
+    submitBtn.textContent = `送信中…（${dates.length}件）`;
+    let results = [];
+    try{
+      const r = await addManyBookingsRemote(dates.map(d => Object.assign({}, booking, { date: d })));
+      if(r && r.success && Array.isArray(r.results)){
+        results = r.results;
+      }else{
+        results = dates.map(d => ({ date: d, success:false, error: (r && r.error) || "登録に失敗しました" }));
       }
+    }catch(e){
+      results = dates.map(d => ({ date: d, success:false, error: "通信エラー" }));
     }
     submitBtn.disabled = false; submitBtn.textContent = "予約を確定する";
 
@@ -1200,8 +1234,30 @@ function showToast(msg, isErr, durationMs){
   document.getElementById("date-input").value = currentDate;
   await loadBookings();
   render();
-  setInterval(async ()=>{
+  // ---------- 自動更新 ----------
+  // 15秒ごとに全端末が問い合わせると、Apps Scriptの実行枠を使い切ってしまう。
+  // 「画面を見ているとき」「操作しているとき」だけ、1分間隔で更新する。
+  const REFRESH_INTERVAL_MS = 60000;      // 更新の間隔（1分）
+  const IDLE_STOP_MS = 10 * 60 * 1000;    // 10分操作がなければ更新を止める
+  let lastActivity = Date.now();
+
+  ["click","keydown","touchstart","scroll"].forEach(ev=>{
+    document.addEventListener(ev, ()=>{ lastActivity = Date.now(); }, { passive:true });
+  });
+
+  async function autoRefresh(){
+    if(document.hidden) return;                                                      // 裏に回っている
+    if(Date.now() - lastActivity > IDLE_STOP_MS) return;                             // 放置されている
+    if(document.getElementById("overlay").classList.contains("show")) return;         // 入力中
+    if(document.getElementById("cancel-overlay").classList.contains("show")) return;  // 確認中
     try{ await loadBookings(); render(); }catch(e){}
-  }, 15000);
+  }
+
+  // 画面に戻ってきたときは、待たずにすぐ最新にする
+  document.addEventListener("visibilitychange", ()=>{
+    if(!document.hidden){ lastActivity = Date.now(); autoRefresh(); }
+  });
+
+  setInterval(autoRefresh, REFRESH_INTERVAL_MS);
 })();
 </script>
