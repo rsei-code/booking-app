@@ -456,7 +456,7 @@ window.__bookingsBoot = (function(){
 <div class="toast" id="toast"><span class="dot"></span><span id="toast-text"></span></div>
 
 <script>
-const ROOMS = ["大会議室","小会議室","ミーティングルームA","ミーティングルームB","応接室"];
+const ROOMS = ["大会議室","小会議室","ミーティングルームA","ミーティングルームB"];
 const CARS  = ["プリウス","ハイエース","プロボックス","軽トラ","軽バン"];
 const GUEST_RESOURCE = "来客";
 const DAY_START = 8;
@@ -546,7 +546,7 @@ async function ensureWindow(){
 }
 
 // ★高速化③ 日付・区分ごとの索引を1回だけ作る。
-// 以前は「会議室5つ × 7日 = 35回」予約全件を絞り込み直していた。
+// 以前は「会議室の数 × 7日」の回数だけ予約全件を絞り込み直していた。
 let bookingIndex = null;
 function invalidateIndex(){ bookingIndex = null; }
 function bookingsOn(cat, date){
@@ -946,6 +946,21 @@ function populateLinkRoomOptions(){
   const sel = document.getElementById("f-linkroom-resource");
   sel.innerHTML = ROOMS.map(r => `<option value="${r}">${r}</option>`).join("");
 }
+// 選択肢から外した対象（廃止した会議室など）の予約を編集するときに使う。
+// そのままだと選択肢が無く、黙って先頭の会議室に書き換わってしまうため、
+// 一時的に選択肢を足して元の対象を表示する。新規予約では出てこない。
+function ensureResourceOption(selectId, resource){
+  if(!resource) return;
+  const sel = document.getElementById(selectId);
+  const exists = Array.from(sel.options).some(o => o.value === resource);
+  if(!exists){
+    const opt = document.createElement("option");
+    opt.value = resource;
+    opt.textContent = `${resource}（現在は予約できません）`;
+    sel.appendChild(opt);
+  }
+  sel.value = resource;
+}
 function onCategoryChangeInModal(){
   const cat = document.getElementById("f-category").value;
   applyCategoryFieldVisibility(cat);
@@ -1127,13 +1142,13 @@ function openEditModal(id){
       editingLinkedRoomId = linkedRoom.id;
       document.getElementById("f-linkroom-check").checked = true;
       document.getElementById("field-linkroom-select-wrap").style.display = "";
-      document.getElementById("f-linkroom-resource").value = linkedRoom.resource;
+      ensureResourceOption("f-linkroom-resource", linkedRoom.resource);
     } else {
       document.getElementById("f-linkroom-check").checked = false;
       document.getElementById("field-linkroom-select-wrap").style.display = "none";
     }
   } else {
-    document.getElementById("f-resource").value = b.resource;
+    ensureResourceOption("f-resource", b.resource);
   }
 
   document.getElementById("overlay").classList.add("show");
